@@ -24,6 +24,10 @@ apps = [
            'name': 'info',
         'sources': ['info.cpp'],
     },
+    {
+           'name': 'atom',
+        'sources': ['atom.cpp'],
+    },
 ]
 
 foreach app : apps

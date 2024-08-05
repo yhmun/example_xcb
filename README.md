@@ -36,3 +36,7 @@ This contains useful xcb example snippets.
 * xcb_info
 
     this shows how to read xcb_connection and xcb_screen information
+
+* xcb_atom
+
+    this demonstrates reading and caching xcb_atom values
