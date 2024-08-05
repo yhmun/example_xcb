@@ -20,6 +20,10 @@ configure_file(output: 'config.h', configuration: config_h)
 xcb_dep = dependency('xcb')
 
 apps = [
+    {
+           'name': 'info',
+        'sources': ['info.cpp'],
+    },
 ]
 
 foreach app : apps

@@ -30,3 +30,9 @@ This contains useful xcb example snippets.
     ```
     meson compile <src_root>/build
     ```
+
+## Showcases
+
+* xcb_info
+
+    this shows how to read xcb_connection and xcb_screen information
