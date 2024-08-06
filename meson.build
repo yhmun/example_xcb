@@ -28,6 +28,10 @@ apps = [
            'name': 'atom',
         'sources': ['atom.cpp'],
     },
+    {
+           'name': 'signal',
+        'sources': ['signal.cpp'],
+    },
 ]
 
 foreach app : apps

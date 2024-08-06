@@ -40,3 +40,9 @@ This contains useful xcb example snippets.
 * xcb_atom
 
     this demonstrates reading and caching xcb_atom values
+
+* xcb_signal
+
+    this demonstrates how to handle unix signal-safe
+
+    - Press Ctrl+C
