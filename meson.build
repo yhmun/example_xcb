@@ -4,7 +4,7 @@ project('example_xcb', 'cpp',
       meson_version: '>= 0.63.0',
     default_options: [
             'warning_level=3',
-            'cpp_std=c++14'
+            'cpp_std=c++20'
         ]
 )
 
@@ -32,6 +32,10 @@ apps = [
            'name': 'signal',
         'sources': ['signal.cpp'],
     },
+    {
+           'name': 'selection',
+        'sources': ['selection.cpp'],
+    },
 ]
 
 foreach app : apps
@@ -41,6 +45,7 @@ foreach app : apps
      include_directories: [],
                link_with: [],
             dependencies: [xcb_dep],
+        override_options: ['cpp_std=c++20'],
              install_dir: 'bin' / 'sys',
                   install: true
     )
