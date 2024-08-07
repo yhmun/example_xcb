@@ -46,3 +46,11 @@ This contains useful xcb example snippets.
     this demonstrates how to handle unix signal-safe
 
     - Press Ctrl+C
+
+* xcb_selection
+
+    this shows how to handle selections
+
+    - `PRIMARY`: Middle mouse clipboard
+    - `SECONDARY`: Virtually unused these days
+    - `CLIPBOARD`: Ctrl+C clipboard
