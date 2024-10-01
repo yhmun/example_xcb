@@ -78,11 +78,7 @@ public:
         }
         screen = iter.data;
 
-        std::vector<uint32_t> values = {XCB_EVENT_MASK_PROPERTY_CHANGE, 0};
-        auto cookie = xcb_change_window_attributes_checked(connection, screen->root, XCB_CW_EVENT_MASK, values.data());
-        auto error = xcb_request_check(connection, cookie);
-        if (error) {
-            fprintf(stderr, "xcb_change_window_attributes() failed\n");
+        if (!SetWindowAttribute(screen->root)) {
             return false;
         }
 
@@ -143,6 +139,19 @@ public:
         }
 
         return RunEventLoop();
+    }
+
+    bool SetWindowAttribute(xcb_window_t window)
+    {
+        std::vector<uint32_t> values = {XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_PROPERTY_CHANGE, 0};
+        auto cookie = xcb_change_window_attributes_checked(connection, window, XCB_CW_EVENT_MASK, values.data());
+        auto error = xcb_request_check(connection, cookie);
+        if (error) {
+            fprintf(stderr, "xcb_change_window_attributes() failed\n");
+            return false;
+        }
+        printf(" * xcb_change_window_attributes     : 0x%08X\n", window);
+        return true;
     }
 
     bool SetSelectionOwner(xcb_atom_t selection)
@@ -260,8 +269,12 @@ public:
         printf("   - XCB_PROPERTY_NOTIFY            : seq: %4u, time: %10u, window: 0x%08X, state: '%s', atom: '%s'\n",
             event->sequence, event->time, event->window, event->state == XCB_PROPERTY_NEW_VALUE ? "new" : "del", GetAtomName(event->atom));
 
+        if (event->atom != incr_property) {
+            return true;
+        }
+
         if (event->state == XCB_PROPERTY_NEW_VALUE) {
-            if (event->atom == incr_property) {
+            if (event->window == window) {
                 auto cookie = xcb_get_property(connection, 1, window, event->atom, XCB_GET_PROPERTY_TYPE_ANY, 0, INT32_MAX / 4);
                 auto reply = xcb_get_property_reply(connection, cookie, nullptr);
                 if (!reply) {
@@ -284,6 +297,31 @@ public:
                         GetNextSelectionTarget();
                     }
                     free(reply);
+                }
+            }
+        } else {
+            if (event->window != window) {
+                auto bytes = read(read_fd, read_buf, INCR_CHUNK_SIZE);
+                if (bytes < 0) {
+                    fprintf(stderr, "read() failed (err: '%s')\n", strerror(errno));
+                    return false;
+                }
+                incr_bytes += bytes;
+                printf("       . bytes : %u\n", incr_bytes);
+                printf("       . chunk : %lu\n", bytes);
+
+                auto cookie = xcb_change_property_checked(connection, XCB_PROP_MODE_REPLACE,
+                    event->window, event->atom, incr_target, 8, bytes, &read_buf);
+                auto error = xcb_request_check(connection, cookie);
+                if (error) {
+                    fprintf(stderr, "xcb_change_property_checked() failed (err: %d)\n", error->error_code);
+                    free(error);
+                    return true;
+                }
+                if (!bytes) {
+                    incr_property = XCB_ATOM_NONE;
+                    incr_target = XCB_ATOM_NONE;
+                    incr_bytes = 0;
                 }
             }
         }
@@ -354,20 +392,9 @@ public:
             return true;
         }
 
-        if (incr_request.requestor) {
-            if (incr_request.requestor != event->requestor ||
-                incr_request.selection != event->selection ||
-                incr_request.target    != event->target    ||
-                incr_request.property  != event->property) {
-                //pending_requests.push(*event);
-                //return true;
-                incr_request.requestor = XCB_WINDOW_NONE;
-            }
-        }
-
         xcb_atom_t image_atom = XCB_ATOM_NONE;
-        //image_atom = GetAtom("image/png");
-        image_atom = GetAtom("image/jpeg");
+        image_atom = GetAtom("image/png");
+        //image_atom = GetAtom("image/jpeg");
 
         xcb_void_cookie_t cookie = {};
         if (event->target == GetAtom("TARGETS")) {
@@ -407,42 +434,26 @@ public:
         } else if (image_atom && image_atom == event->target) {
             if (read_fd == INVALID_FD) {
                 event->property = XCB_ATOM_NONE;
-            } else if (incr_request.requestor) {
-                auto bytes = read(read_fd, read_buf, INCR_CHUNK_SIZE);
-                if (bytes < 0) {
-                    event->property = XCB_ATOM_NONE;
-                    fprintf(stderr, "read() failed (err: '%s')\n", strerror(errno));
-                }
-                cookie = xcb_change_property_checked(connection, XCB_PROP_MODE_REPLACE,
-                    incr_request.requestor, event->property, event->target, 8, bytes, &read_buf);
-                printf("       . chunk : %lu\n", bytes);
-
-                if (bytes == 0) {
-                    incr_request.requestor = XCB_WINDOW_NONE;
-                    if (!pending_requests.empty()) {
-                        SendSelectionResponse(event);
-
-                        auto request = pending_requests.front();
-                        pending_requests.pop();
-                        return ProcSelectionRequest(&request);
-                    }
-                }
             } else {
                 lseek(read_fd, 0, SEEK_SET);
-                if (read_fd_len >= INCR_CHUNK_SIZE) {
-                    incr_request = *event;
-                    cookie = xcb_change_property_checked(connection, XCB_PROP_MODE_REPLACE,
-                        event->requestor, event->property, GetAtom("INCR"), 32, 1, &read_fd_len);
-                    printf("       . 'INCR': %u\n", read_fd_len);
-                } else {
+                if (read_fd_len < INCR_CHUNK_SIZE) {
                     auto bytes = read(read_fd, read_buf, INCR_CHUNK_SIZE);
                     if (bytes < 0) {
                         event->property = XCB_ATOM_NONE;
                         fprintf(stderr, "read() failed (err: '%s')\n", strerror(errno));
+                    } else {
+                        cookie = xcb_change_property_checked(connection, XCB_PROP_MODE_REPLACE,
+                            event->requestor, event->property, event->target, 8, bytes, &read_buf);
                     }
+                } else if (!SetWindowAttribute(event->requestor)) {
+                    event->property = XCB_ATOM_NONE;
+                } else {
+                    incr_property = event->property;
+                    incr_target = event->target;
+                    incr_bytes = 0;
                     cookie = xcb_change_property_checked(connection, XCB_PROP_MODE_REPLACE,
-                        event->requestor, event->property, event->target, 8, bytes, &read_buf);
-                    printf("       . chunk : %lu\n", bytes);
+                        event->requestor, event->property, GetAtom("INCR"), 32, 1, &read_fd_len);
+                    printf("       . 'INCR': %u\n", read_fd_len);
                 }
             }
         }
@@ -739,10 +750,9 @@ private:
     std::map<xcb_atom_t, selection_t>           selections                  = {};
     xcb_atom_t                                  pending_target              = XCB_ATOM_NONE;
     xcb_atom_t                                  incr_property               = XCB_ATOM_NONE;
+    xcb_atom_t                                  incr_target                 = XCB_ATOM_NONE;
+    uint32_t                                    incr_bytes                  = 0;
     int32_t                                     write_fd                    = INVALID_FD;
-
-    xcb_selection_request_event_t               incr_request                = {};
-    std::queue<xcb_selection_request_event_t>   pending_requests            = {};
     int32_t                                     read_fd                     = INVALID_FD;
     uint32_t                                    read_fd_len                 = 0;
     uint8_t                                     read_buf[INCR_CHUNK_SIZE]   = {};
