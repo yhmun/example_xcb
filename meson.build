@@ -36,6 +36,10 @@ apps = [
            'name': 'selection',
         'sources': ['selection.cpp'],
     },
+    {
+           'name': 'dnd',
+        'sources': ['dnd.cpp'],
+    },
 ]
 
 foreach app : apps
