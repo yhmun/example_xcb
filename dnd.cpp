@@ -36,8 +36,22 @@ public:
             }
         }
 
-        for (auto window : windows) {
-            xcb_destroy_window(connection, window);
+        if (gc != XCB_NONE) {
+            auto cookie = xcb_free_gc_checked(connection, gc);
+            auto error = xcb_request_check(connection, cookie);
+            if (error) {
+                fprintf(stderr, "xcb_free_gc_checked() failed\n");
+                free(error);
+            }
+        }
+
+        if (win != XCB_WINDOW_NONE) {
+            auto cookie = xcb_destroy_window_checked(connection, win);
+            auto error = xcb_request_check(connection, cookie);
+            if (error) {
+                fprintf(stderr, "xcb_destroy_window_checked() failed\n");
+                free(error);
+            }
         }
 
         if (connection) {
@@ -78,17 +92,21 @@ public:
 
     bool ShowCase(void)
     {
-        auto window = CreateWindow();
-        if (window == XCB_WINDOW_NONE) {
-            return false;
-        }
-        windows.insert(window);
-
-        if (!MapWindow(window)) {
+        win = CreateWindow(400, 400);
+        if (win == XCB_WINDOW_NONE) {
             return false;
         }
 
-        if (!ChangeProperty(window, GetAtom("XdndAware"), XCB_ATOM_ATOM, 1, &XDND_PROTOCOL_VERSION)) {
+        gc = CreateGContext();
+        if (gc == XCB_NONE) {
+            return false;
+        }
+
+        if (!MapWindow(win)) {
+            return false;
+        }
+
+        if (!ChangeProperty(win, GetAtom("XdndAware"), XCB_ATOM_ATOM, 1, &XDND_PROTOCOL_VERSION)) {
             return false;
         }
 
@@ -111,7 +129,7 @@ public:
 
     bool SetWindowAttribute(xcb_window_t window)
     {
-        std::vector<uint32_t> values = {XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_PROPERTY_CHANGE, 0};
+        std::vector<uint32_t> values = {XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY | XCB_EVENT_MASK_PROPERTY_CHANGE, 0};
         auto cookie = xcb_change_window_attributes_checked(connection, window, XCB_CW_EVENT_MASK, values.data());
         auto error = xcb_request_check(connection, cookie);
         if (error) {
@@ -122,139 +140,200 @@ public:
         return true;
     }
 
+    void ClearReceive(void)
+    {
+        receive.dst_win     = XCB_WINDOW_NONE;
+        receive.src_win     = XCB_WINDOW_NONE;
+        receive.version     = 0;
+        receive.flags       = 0;
+        receive.timestamp   = 0;
+        receive.dst_x       = 0;
+        receive.dst_y       = 0;
+        receive.root_x      = 0;
+        receive.root_y      = 0;
+        receive.action      = XCB_ATOM_NONE;
+        receive.types.clear();
+    }
+
+    bool SendReceiveStatus(bool accept, bool want_position = true)
+    {
+        xcb_client_message_event_t event = {
+            .response_type  = XCB_CLIENT_MESSAGE,
+            .format         = 32,
+            .sequence       = 0,
+            .window         = receive.src_win,
+            .type           = GetAtom("XdndStatus"),
+            .data           = { .data32 = { receive.dst_win, 0, 0, 0, 0 }},
+        };
+
+        // Bit 0 is set if the current target will accept the drop
+        if (accept) {
+            event.data.data32[1] |= 0x1;
+        }
+
+        // Bit 1 is set if the target wants XdndPosition messages while the mouse moves inside the rectangle in data.l[2,3]
+        if (want_position) {
+            event.data.data32[1] |= 0x2;
+        }
+
+        // a rectangle in root coordinates that means "don't send another XdndPosition message until the mouse moves out of here"
+        // an empty rectangle means "send another message when the mouse moves"
+        event.data.data32[2] = (static_cast<uint32_t>(receive.root_x) << 16) | receive.root_y;
+        event.data.data32[3] = (static_cast<uint32_t>(win_w) << 16) | win_h;
+
+        // the action accepted by the target
+        if (accept && receive.version >= 2) {
+            event.data.data32[4] = receive.action;
+        }
+
+        auto cookie = xcb_send_event_checked(connection, 0, receive.src_win, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&event));
+        auto error = xcb_request_check(connection, cookie);
+        if (error) {
+            printf("Failed to send XdndStatus event to xcb_window: 0x%08x (err: %d)\n", receive.src_win, error->error_code);
+            free(error);
+        }
+        printf("   - XdndStatus                     : window: 0x%08x, accepted: %s, want_position: %s, rect_x: %u, rect_y: %u, rect_w: %u, rect_h: %u",
+            receive.src_win, accept ? "yes" : "no", want_position ? "yes" : "no", event.data.data32[2] >> 16, event.data.data32[2] & 0xffff, event.data.data32[3] >> 16, event.data.data32[3] & 0xffff);
+        if (event.data.data32[4]) {
+            printf(", action: %s", GetAtomName(event.data.data32[4]));
+        }
+        printf("\n");
+        return true;
+    }
+
+    bool SendReceiveFinish(bool accept)
+    {
+        if (receive.version >= 2) {
+            xcb_client_message_event_t event = {
+                .response_type  = XCB_CLIENT_MESSAGE,
+                .format         = 32,
+                .sequence       = 0,
+                .window         = receive.src_win,
+                .type           = GetAtom("XdndFinished"),
+                .data           = { .data32 = { receive.dst_win, 0, 0, 0, 0 }},
+            };
+
+            // Bit 0 is set if the current target accepted the drop and successfully performed the accepted drop action
+            if (accept) {
+                event.data.data32[1] |= 0x1;
+            }
+
+            // the action performed by the target
+            if (accept && receive.version >= 2) {
+                event.data.data32[2] = receive.action;
+            }
+
+            auto cookie = xcb_send_event_checked(connection, 0, receive.src_win, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&event));
+            auto error = xcb_request_check(connection, cookie);
+            if (error) {
+                printf("Failed to send XdndFinished event to xcb_window: 0x%08x (err: %d)\n", receive.src_win, error->error_code);
+                free(error);
+                ClearReceive();
+                return false;
+            }
+            printf("   - XdndFinished                   : window: 0x%08x, accepted: %s", receive.src_win, accept ? "yes" : "no");
+            if (event.data.data32[2]) {
+                printf(", action: %s", GetAtomName(event.data.data32[2]));
+            }
+            printf("\n");
+        }
+        ClearReceive();
+        return true;
+    }
+
     bool ProcClientMessage(xcb_client_message_event_t *event)
     {
         printf("   - XCB_CLIENT_MESSAGE             : seq: %4u, window: 0x%08X, type: %s", event->sequence, event->window, GetAtomName(event->type));
 
         if (event->type == GetAtom("XdndEnter")) {
-            xcb_window_t source     = event->data.data32[0];
-            uint32_t     version    = event->data.data32[1] >> 24;
-            bool         type_list  = event->data.data32[1] & 1;
-            printf(", source: 0x%08X, version: %u, type_list: %s, formats:\n", source, version, type_list ? "y" : "n");
-
-            std::set<xcb_atom_t> formats = {};
-            if (type_list) {
-                auto cookie = xcb_get_property(connection, 0, source, GetAtom("XdndTypeList"), XCB_ATOM_ANY, 0, 2048);
+            bool has_list = event->data.data32[1] & 1;
+            receive.dst_win = event->window;
+            receive.src_win = event->data.data32[0];
+            receive.version = event->data.data32[1] >> 24;
+            if (has_list) {
+                auto cookie = xcb_get_property(connection, 0, receive.src_win, GetAtom("XdndTypeList"), XCB_ATOM_ANY, 0, 2048);
                 auto reply = xcb_get_property_reply(connection, cookie, nullptr);
                 if (!reply) {
                     fprintf(stderr, "xcb_get_property_reply() failed\n");
                     return false;
                 }
-                auto atoms = reinterpret_cast<xcb_atom_t *>(xcb_get_property_value(reply));
+                auto types = reinterpret_cast<xcb_atom_t *>(xcb_get_property_value(reply));
                 for (uint32_t i = 0; i < reply->length; i++) {
-                    formats.insert(atoms[i]);
+                    receive.types.insert(types[i]);
                 }
                 free(reply);
             } else {
-                if (event->data.data32[2]) {
-                    formats.insert(event->data.data32[2]);
-                }
-                if (event->data.data32[3]) {
-                    formats.insert(event->data.data32[3]);
-                }
-                if (event->data.data32[4]) {
-                    formats.insert(event->data.data32[4]);
+                for (auto i = 2; i < 5; i++) {
+                    auto type = event->data.data32[i];
+                    if (type) {
+                        receive.types.insert(type);
+                    }
                 }
             }
-            for (auto format : formats) {
-                printf("     - %s\n", GetAtomName(format));
+            printf(", source: 0x%08X, version: %u, has_list: %s\n", receive.src_win, receive.version, has_list ? "yes" : "no");
+            for (auto type : receive.types) {
+                printf("     - type: %s\n", GetAtomName(type));
             }
-            source_ver = version;
-            source_formats = formats;
         } else if (event->type == GetAtom("XdndPosition")) {
-            xcb_window_t source     = event->data.data32[0];
-            uint32_t     flags      = event->data.data32[1];        // reserved for future use
-            uint32_t     x          = 0;
-            uint32_t     y          = 0;
-            uint32_t     root_x     = 0xffff & (event->data.data32[2] >> 16);
-            uint32_t     root_y     = 0xffff & event->data.data32[2];
-            uint32_t     timestamp  = event->data.data32[3];        // in version 1
-            xcb_atom_t   action     = event->data.data32[4];        // in version 2
-
-            {
-                auto cookie = xcb_translate_coordinates(connection, screen->root, event->window, root_x, root_y);
-                auto reply = xcb_translate_coordinates_reply(connection, cookie, nullptr);
-                if (!reply) {
-                    return false;
-                }
-                x = reply->dst_x;
-                y = reply->dst_y;
-                free(reply);
+            receive.src_win = event->data.data32[0];
+            receive.flags = event->data.data32[1]; // reserved for future use
+            printf(", source: 0x%08X, flags: 0x%08X", receive.src_win, receive.flags);
+            if (receive.version >= 1) {
+                receive.timestamp = event->data.data32[3];
+                printf(", timestamp: %u", receive.timestamp);
             }
-            printf(", source: 0x%08X, flags: 0x%08X, x: %u, y: %u, root_x: %u, root_y: %u, timestamp: %u, action: %s\n", source, flags, x, y, root_x, root_y, timestamp, GetAtomName(action));
-
-            {
-                xcb_client_message_event_t reply = {
-                    .response_type  = XCB_CLIENT_MESSAGE,
-                    .format         = 32,
-                    .sequence       = 0,
-                    .window         = source,
-                    .type           = GetAtom("XdndStatus"),
-                    .data           = { .data32 = { event->window, 1, 0, 0, action }},
-                };
-                auto cookie = xcb_send_event_checked(connection, 0, source, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&reply));
-                auto error = xcb_request_check(connection, cookie);
-                if (error) {
-                    printf("failed to send event to xcb_window: 0x%08x (err: %d)\n", source, error->error_code);
-                    free(error);
-                    return false;
-                }
-                source_action = action;
+            if (receive.version >= 2) {
+                receive.action = event->data.data32[4];
+                printf(", action: %s", GetAtomName(receive.action));
             }
-        } else if (event->type == GetAtom("XdndStatus")) {
-            xcb_window_t target     = event->data.data32[0];
-            bool         drop       = event->data.data32[1] & 1;
-            bool         want       = event->data.data32[1] & 2;
-            uint32_t     rect_x     = 0xffff & (event->data.data32[2] >> 16);
-            uint32_t     rect_y     = 0xffff & event->data.data32[2];
-            uint32_t     rect_w     = 0xffff & (event->data.data32[3] >> 16);
-            uint32_t     rect_h     = 0xffff & event->data.data32[3];
-            uint32_t     action     = event->data.data32[4];        // in version 2
-            printf(", target: 0x%08X, drop: %d, want: %d, rect: (%u, %u, %u, %u), action: %u\n", target, drop, want, rect_x, rect_y, rect_w, rect_h, action);
+            receive.root_x = 0xffff & (event->data.data32[2] >> 16);
+            receive.root_y = 0xffff & event->data.data32[2];
+            printf(", root_x: %u, root_y: %u", receive.root_x, receive.root_y);
+
+            auto cookie = xcb_translate_coordinates(connection, screen->root, event->window, receive.root_x, receive.root_y);
+            auto reply = xcb_translate_coordinates_reply(connection, cookie, nullptr);
+            if (!reply) {
+                printf("\n");
+                SendReceiveStatus(false);
+                return false;
+            }
+            receive.dst_x = reply->dst_x;
+            receive.dst_y = reply->dst_y;
+            printf(", dst_x: %u, dst_y: %u\n", receive.dst_x, receive.dst_y);
+            free(reply);
+
+            bool accept = receive.dst_x >= rect.x && receive.dst_x <= rect.x + rect.width &&
+                          receive.dst_y >= rect.y && receive.dst_y <= rect.y + rect.height;
+            SendReceiveStatus(accept);
         } else if (event->type == GetAtom("XdndLeave")) {
-            xcb_window_t source     = event->data.data32[0];
-            uint32_t     flags      = event->data.data32[1];        // reserved for future use
-            printf(", source: 0x%08X, flags: 0x%08X\n", source, flags);
+            receive.src_win = event->data.data32[0];
+            receive.flags = event->data.data32[1]; // reserved for future use
+            printf(", source: 0x%08X, flags: 0x%08X\n", receive.src_win, receive.flags);
+            ClearReceive();
         } else if (event->type == GetAtom("XdndDrop")) {
-            xcb_window_t source     = event->data.data32[0];
-            uint32_t     flags      = event->data.data32[1];        // reserved for future use
-            uint32_t     timestamp  = event->data.data32[2];        // in version 1
-            printf(", source: 0x%08X, flags: 0x%08X, timestamp: %u\n", source, flags, timestamp);
-
-            xcb_atom_t target = GetAtom("text/plain");
-            if (source_formats.find(target) != source_formats.end()) {
-                xcb_timestamp_t time = source_ver >= 1 ? timestamp : XCB_CURRENT_TIME;
-                xcb_atom_t property = XCB_ATOM_CUT_BUFFER0 + (cut_buffer_idx++ % 8);
-                this->source = source;
-                auto cookie = xcb_convert_selection_checked(connection, event->window, GetAtom("XdndSelection"), target, property, time);
-                auto error = xcb_request_check(connection, cookie);
-                if (error) {
-                    printf("failed to send event to xcb_window: 0x%08x (err: %d)\n", source, error->error_code);
-                    free(error);
-                    return false;
-                }
-            } else if (source_ver >= 2) {
-                xcb_client_message_event_t reply = {
-                    .response_type  = XCB_CLIENT_MESSAGE,
-                    .format         = 32,
-                    .sequence       = 0,
-                    .window         = source,
-                    .type           = GetAtom("XdndFinished"),
-                    .data           = { .data32 = { event->window, 0, 0, 0, 0 }},
-                };
-                auto cookie = xcb_send_event_checked(connection, 0, source, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&reply));
-                auto error = xcb_request_check(connection, cookie);
-                if (error) {
-                    printf("failed to send event to xcb_window: 0x%08x (err: %d)\n", source, error->error_code);
-                    free(error);
-                    return false;
-                }
+            xcb_timestamp_t timestamp = XCB_CURRENT_TIME;
+            receive.src_win = event->data.data32[0];
+            receive.flags = event->data.data32[1]; // reserved for future use
+            printf(", source: 0x%08X, flags: 0x%08X", receive.src_win, receive.flags);
+            if (receive.version >= 1) {
+                timestamp = event->data.data32[2];
+                receive.timestamp = event->data.data32[2];
+                printf(", timestamp: %u", receive.timestamp);
             }
-        } else if (event->type == GetAtom("XdndFinished")) {        // in version 2
-            xcb_window_t target     = event->data.data32[0];
-            bool         drop       = event->data.data32[1] & 1;    // in version 5
-            uint32_t     action     = event->data.data32[2];        // in version 5
-            printf(", target: 0x%08X, drop: %d, action: %u\n", target, drop, action);
+            printf("\n");
+
+            for (auto type : receive.types) {
+                xcb_atom_t property = XCB_ATOM_CUT_BUFFER0 + (cut_buffer_idx++ % 8);
+                auto cookie = xcb_convert_selection_checked(connection, event->window, GetAtom("XdndSelection"), type, property, timestamp);
+                auto error = xcb_request_check(connection, cookie);
+                if (error) {
+                    fprintf(stderr, "xcb_convert_selection_checked() failed (err: %d)\n", error->error_code);
+                    free(error);
+                    SendReceiveFinish(false);
+                    return false;
+                }
+                receive.targets.insert(type);
+            }
         } else {
             printf("\n");
         }
@@ -267,37 +346,62 @@ public:
             event->sequence, event->time, event->requestor, GetAtomName(event->selection), GetAtomName(event->target), event->property ? GetAtomName(event->property) : "(null)");
 
         if (event->selection == GetAtom("XdndSelection")) {
-            if (event->target == GetAtom("text/plain")) {
-                if (event->property != XCB_ATOM_NONE) {
-                    auto cookie = xcb_get_property(connection, true, event->requestor, event->property, XCB_ATOM_ANY, 0, 2048);
-                    auto reply = xcb_get_property_reply(connection, cookie, nullptr);
-                    if (reply) {
-                        std::string text = "";
-                        text.assign(reinterpret_cast<char *>(xcb_get_property_value(reply)), xcb_get_property_value_length(reply));
-                        printf(", value: '%s'", text.c_str());
-                        free(reply);
+            if (receive.src_win == XCB_WINDOW_NONE) {
+                printf("\n");
+                return true;
+            }
+
+            auto cookie = xcb_get_property(connection, true, event->requestor, event->property, XCB_ATOM_ANY, 0, 2048);
+            auto reply = xcb_get_property_reply(connection, cookie, nullptr);
+            if (reply) {
+                auto len = xcb_get_property_value_length(reply);
+                printf(", len: %d", len);
+                if (event->target == GetAtom("text/plain") ||
+                    event->target == GetAtom("text/uri-list") ||
+                    event->target == GetAtom("application/x-kde4-urilist")) {
+                    std::string text = "";
+                    text.assign(reinterpret_cast<char *>(xcb_get_property_value(reply)), std::min(len, 128));
+                    if (text.back() == '\n') {
+                        text.pop_back();
                     }
+                    if (text.back() == '\r') {
+                        text.pop_back();
+                    }
+                    printf(", value: '%s'", text.c_str());
                 }
-                if (source_ver >= 2) {
-                    xcb_client_message_event_t reply = {
-                        .response_type  = XCB_CLIENT_MESSAGE,
-                        .format         = 32,
-                        .sequence       = 0,
-                        .window         = source,
-                        .type           = GetAtom("XdndFinished"),
-                        .data           = { .data32 = { event->requestor, 1, source_action, 0, 0 }},
-                    };
-                    auto cookie = xcb_send_event_checked(connection, 0, source, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&reply));
-                    auto error = xcb_request_check(connection, cookie);
-                    if (error) {
-                        printf("failed to send event to xcb_window: 0x%08x (err: %d)\n", source, error->error_code);
-                        free(error);
-                        return false;
-                    }
+                free(reply);
+            }
+
+            printf("\n");
+            receive.targets.erase(event->target);
+            if (receive.targets.empty()) {
+                SendReceiveFinish(true);
+            }
+        } else {
+            printf("\n");
+        }
+        return true;
+    }
+
+    bool ProcConfigureNotify(xcb_configure_notify_event_t *event)
+    {
+        printf("   - XCB_CONFIGURE_NOTIFY           : seq: %4u, event: 0x%08X, window: 0x%08X, above_sibling: 0x%08x, x: %d, y: %d, width: %u, height: %u, border_width: %u, override_redirect: %u\n", event->sequence, event->event, event->window, event->above_sibling, event->x, event->y, event->width, event->height, event->border_width, event->override_redirect);
+
+        if (event->window == win) {
+            if (event->width != win_w || event->height != win_h) {
+                rect.x = event->width / 4;
+                rect.y = event->height / 4;
+                rect.width = event->width / 2;
+                rect.height = event->height / 2;
+                if (!ClearArea() || !FillRectangle()) {
+                    return false;
                 }
             }
+            win_x = event->x;
+            win_y = event->y;
+            win_w = event->width;
+            win_h = event->height;
         }
-        printf("\n");
         return true;
     }
 
@@ -334,14 +438,14 @@ public:
         return true;
     }
 
-    xcb_window_t CreateWindow(void)
+    xcb_window_t CreateWindow(uint16_t width, uint16_t height)
     {
-        uint32_t mask = XCB_CW_BACK_PIXMAP | XCB_CW_EVENT_MASK;
-        std::vector<uint32_t> values = { XCB_BACK_PIXMAP_NONE, XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_BUTTON_PRESS};
+        uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
+        std::vector<uint32_t> values = { screen->black_pixel, XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_BUTTON_PRESS};
 
         xcb_window_t window = xcb_generate_id(connection);
         auto cookie = xcb_create_window_checked(connection, screen->root_depth, window, screen->root,
-            0, 0, 200, 100, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, mask, values.data());
+            0, 0, width, height, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, mask, values.data());
         auto error = xcb_request_check(connection, cookie);
         if (error) {
             fprintf(stderr, "xcb_create_window_checked() failed (err: %d)\n", error->error_code);
@@ -349,6 +453,46 @@ public:
             return XCB_WINDOW_NONE;
         }
         return window;
+    }
+
+    xcb_gcontext_t CreateGContext(void)
+    {
+        uint32_t mask = XCB_GC_FOREGROUND | XCB_GC_BACKGROUND | XCB_GC_GRAPHICS_EXPOSURES;
+        std::vector<uint32_t> values = { screen->white_pixel, screen->black_pixel, 0 };
+
+        xcb_gcontext_t gc = xcb_generate_id(connection);
+        auto cookie = xcb_create_gc_checked(connection, gc, screen->root, mask, values.data());
+        auto error = xcb_request_check(connection, cookie);
+        if (error) {
+            fprintf(stderr, "xcb_create_gc_checked() failed (err: %d)\n", error->error_code);
+            free(error);
+            return XCB_NONE;
+        }
+        return gc;
+    }
+
+    bool ClearArea(void)
+    {
+        auto cookie = xcb_clear_area_checked(connection, 1, win, 0, 0, win_w, win_h);
+        auto error = xcb_request_check(connection, cookie);
+        if (error) {
+            fprintf(stderr, "xcb_clear_area_checked() failed (err: %d)\n", error->error_code);
+            free(error);
+            return false;
+        }
+        return true;
+    }
+
+    bool FillRectangle(void)
+    {
+        auto cookie = xcb_poly_fill_rectangle_checked(connection, win, gc, 1, &rect);
+        auto error = xcb_request_check(connection, cookie);
+        if (error) {
+            fprintf(stderr, "xcb_poly_fill_rectangle_checked() failed (err: %d)\n", error->error_code);
+            free(error);
+            return false;
+        }
+        return true;
     }
 
     bool MapWindow(xcb_window_t window)
@@ -374,6 +518,11 @@ public:
                 break;
             case XCB_SELECTION_NOTIFY:
                 if (!ProcSelectionNotify(reinterpret_cast<xcb_selection_notify_event_t *>(event))) {
+                    return false;
+                }
+                break;
+            case XCB_CONFIGURE_NOTIFY:
+                if (!ProcConfigureNotify(reinterpret_cast<xcb_configure_notify_event_t *>(event))) {
                     return false;
                 }
                 break;
@@ -419,6 +568,10 @@ public:
 
     const char *GetAtomName(xcb_atom_t atom)
     {
+        if (atom == XCB_ATOM_NONE) {
+            return "XCB_ATOM_NONE";
+        }
+
         auto iter = atom_names.find(atom);
         if (iter != atom_names.end()) {
             return iter->second.c_str();
@@ -516,14 +669,31 @@ private:
     const xcb_setup_t                          *setup                       = nullptr;
     xcb_screen_t                               *screen                      = nullptr;
     uint8_t                                     cut_buffer_idx              = 0;
-    xcb_window_t                                source                      = XCB_WINDOW_NONE;
-    uint32_t                                    source_ver                  = 0;
-    std::set<xcb_atom_t>                        source_formats              = {};
-    xcb_atom_t                                  source_action               = XCB_ATOM_NONE;
-
-    std::set<xcb_window_t>                      windows                     = {};
+    xcb_window_t                                win                         = XCB_WINDOW_NONE;
+    int16_t                                     win_x                       = 0;
+    int16_t                                     win_y                       = 0;
+    uint16_t                                    win_w                       = 0;
+    uint16_t                                    win_h                       = 0;
+    xcb_gcontext_t                              gc                          = XCB_NONE;
+    xcb_rectangle_t                             rect                        = {};
     std::map<std::string, xcb_atom_t>           atoms                       = {};
     std::map<xcb_atom_t, std::string>           atom_names                  = {};
+
+    struct
+    {
+        xcb_window_t                            dst_win                     = XCB_WINDOW_NONE;
+        xcb_window_t                            src_win                     = XCB_WINDOW_NONE;
+        uint32_t                                version                     = 0;
+        uint32_t                                flags                       = 0;
+        uint32_t                                timestamp                   = 0;
+        int16_t                                 dst_x                       = 0;
+        int16_t                                 dst_y                       = 0;
+        int16_t                                 root_x                      = 0;
+        int16_t                                 root_y                      = 0;
+        xcb_atom_t                              action                      = XCB_ATOM_NONE;
+        std::set<xcb_atom_t>                    types                       = {};
+        std::set<xcb_atom_t>                    targets                     = {};
+    } receive;
 };
 
 int main(int argc, char **argv)
