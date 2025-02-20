@@ -3,10 +3,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <list>
 #include <memory>
 #include <map>
 #include <set>
 #include <string>
+#include <stack>
 #include <queue>
 #include <vector>
 #include <errno.h>
@@ -23,6 +25,15 @@ static constexpr uint32_t   XDND_PROTOCOL_VERSION   = 5;
 
 class DND
 {
+    struct window_t
+    {
+        xcb_window_t                id              = XCB_WINDOW_NONE;
+        xcb_rectangle_t             rect            = {};
+        xcb_query_tree_cookie_t     tree_cookie     = {};
+        xcb_get_geometry_cookie_t   geometry_cookie = {};
+        std::list<window_t *>       children        = {};
+    };
+
 public:
     DND(void)
     {
@@ -140,6 +151,162 @@ public:
         return true;
     }
 
+    bool ContainPosition(const xcb_rectangle_t &rect, int16_t x, int16_t y)
+    {
+        return x >= rect.x && x <= rect.x + rect.width &&
+               y >= rect.y && y <= rect.y + rect.height;
+    }
+
+    bool ClearWindowGeometryTree(window_t *&root)
+    {
+        if (!root) {
+            return true;
+        }
+
+        std::queue<window_t *> que = {};
+        que.push(root);
+        while (!que.empty()) {
+            auto node = que.front();
+            que.pop();
+
+            for (auto child : node->children) {
+                que.push(child);
+            }
+            delete node;
+        }
+        root = nullptr;
+        return true;
+    }
+
+    bool QueryWindowGeometryTree(window_t *&root)
+    {
+        if (!ClearWindowGeometryTree(root)) {
+            return false;
+        }
+
+        root = new window_t;
+        root->id = screen->root;
+
+        std::list<window_t *> windows = { root };
+        std::list<window_t *> next_windows = {};
+
+        bool rc = true;
+        while (rc && !windows.empty()) {
+            for (auto win : windows) {
+                win->tree_cookie = xcb_query_tree(connection, win->id);
+            }
+
+            for (auto win : windows) {
+                if (rc) {
+                    auto reply = xcb_query_tree_reply(connection, win->tree_cookie, nullptr);
+                    if (reply) {
+                        auto children = xcb_query_tree_children(reply);
+                        if (reply->children_len) {
+                            for (auto i = reply->children_len - 1; i >= 0; i--) {
+                                auto child = new window_t;
+                                child->id = children[i];
+                                win->children.push_back(child);
+                                next_windows.push_back(child);
+                            }
+                        }
+                        free(reply);
+                    } else {
+                        fprintf(stderr, "xcb_query_tree_reply() failed\n");
+                        rc = false;
+                    }
+                } else {
+                    xcb_discard_reply(connection, win->tree_cookie.sequence);
+                }
+            }
+
+            if (rc) {
+                windows = std::move(next_windows);
+            }
+        }
+
+        if (rc) {
+            std::queue<window_t *> que = {};
+            que.push(root);
+            while (!que.empty()) {
+                auto win = que.front();
+                win->geometry_cookie = xcb_get_geometry(connection, win->id);
+                que.pop();
+
+                for (auto child : win->children) {
+                    que.push(child);
+                }
+            }
+
+            que.push(root);
+            while (!que.empty()) {
+                auto win = que.front();
+                if (rc) {
+                    auto reply = xcb_get_geometry_reply(connection, win->geometry_cookie, nullptr);
+                    if (reply) {
+                        win->rect.x += reply->x;
+                        win->rect.y += reply->y;
+                        win->rect.width = reply->width;
+                        win->rect.height = reply->height;
+                        printf(" - win: 0x%08x, %d, %d, %u, %u\n", win->id, win->rect.x, win->rect.y, win->rect.width, win->rect.height);
+                        free(reply);
+                    } else {
+                        fprintf(stderr, "xcb_get_geometry_reply() failed\n");
+                        rc = false;
+                    }
+                } else {
+                    xcb_discard_reply(connection, win->geometry_cookie.sequence);
+                }
+                que.pop();
+
+                for (auto child : win->children) {
+                    child->rect.x = win->rect.x;
+                    child->rect.y = win->rect.y;
+                    que.push(child);
+                }
+            }
+        }
+        
+        if (!rc) {
+            ClearWindowGeometryTree(root);
+        }
+        return rc;
+    }
+
+    xcb_window_t FindWindowOverPointer(window_t *window, int16_t pointer_x, int16_t pointer_y)
+    {
+        xcb_window_t win = XCB_WINDOW_NONE;
+        if (!window) {
+            return win;
+        }
+
+        for (auto child : window->children) {
+            win = FindWindowOverPointer(child, pointer_x, pointer_y);
+            if (win != XCB_WINDOW_NONE) {
+                return win;
+            }
+        }
+
+        if (ContainPosition(window->rect, pointer_x, pointer_y)) {
+            win = window->id;
+        }
+        return win;
+    }
+
+    bool UnGrabPointer(void)
+    {
+        if (send.grabbed) {
+            auto cookie = xcb_ungrab_pointer(connection, XCB_CURRENT_TIME);
+            auto error = xcb_request_check(connection, cookie);
+            if (error) {
+                fprintf(stderr, "xcb_ungrab_pointer() failed (err: %d)", error->error_code);
+                free(error);
+                return false;
+            }
+            send.grabbed = false;
+        }
+        return true;
+    }
+
     void ClearReceive(void)
     {
         receive.dst_win     = XCB_WINDOW_NONE;
@@ -189,8 +356,9 @@ public:
         auto cookie = xcb_send_event_checked(connection, 0, receive.src_win, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&event));
         auto error = xcb_request_check(connection, cookie);
         if (error) {
-            printf("Failed to send XdndStatus event to xcb_window: 0x%08x (err: %d)\n", receive.src_win, error->error_code);
+            fprintf(stderr, "xcb_send_event_checked() failed 'XdndStatus' (err: %d)\n", error->error_code);
             free(error);
+            return false;
         }
         printf("   - XdndStatus                     : window: 0x%08x, accepted: %s, want_position: %s, rect_x: %u, rect_y: %u, rect_w: %u, rect_h: %u",
             receive.src_win, accept ? "yes" : "no", want_position ? "yes" : "no", event.data.data32[2] >> 16, event.data.data32[2] & 0xffff, event.data.data32[3] >> 16, event.data.data32[3] & 0xffff);
@@ -226,7 +394,7 @@ public:
             auto cookie = xcb_send_event_checked(connection, 0, receive.src_win, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&event));
             auto error = xcb_request_check(connection, cookie);
             if (error) {
-                printf("Failed to send XdndFinished event to xcb_window: 0x%08x (err: %d)\n", receive.src_win, error->error_code);
+                fprintf(stderr, "xcb_send_event_checked() failed 'XdndFinished' (err: %d)\n", error->error_code);
                 free(error);
                 ClearReceive();
                 return false;
@@ -254,7 +422,7 @@ public:
                 auto cookie = xcb_get_property(connection, 0, receive.src_win, GetAtom("XdndTypeList"), XCB_ATOM_ANY, 0, 2048);
                 auto reply = xcb_get_property_reply(connection, cookie, nullptr);
                 if (!reply) {
-                    fprintf(stderr, "xcb_get_property_reply() failed\n");
+                    fprintf(stderr, "xcb_get_property_reply() failed 'XdndTypeList'\n");
                     return false;
                 }
                 auto types = reinterpret_cast<xcb_atom_t *>(xcb_get_property_value(reply));
@@ -293,7 +461,7 @@ public:
             auto cookie = xcb_translate_coordinates(connection, screen->root, event->window, receive.root_x, receive.root_y);
             auto reply = xcb_translate_coordinates_reply(connection, cookie, nullptr);
             if (!reply) {
-                printf("\n");
+                fprintf(stderr, "\nxcb_translate_coordinates_reply() failed\n");
                 SendReceiveStatus(false);
                 return false;
             }
@@ -302,8 +470,7 @@ public:
             printf(", dst_x: %u, dst_y: %u\n", receive.dst_x, receive.dst_y);
             free(reply);
 
-            bool accept = receive.dst_x >= rect.x && receive.dst_x <= rect.x + rect.width &&
-                          receive.dst_y >= rect.y && receive.dst_y <= rect.y + rect.height;
+            bool accept = ContainPosition(rect, receive.dst_x, receive.dst_y);
             SendReceiveStatus(accept);
         } else if (event->type == GetAtom("XdndLeave")) {
             receive.src_win = event->data.data32[0];
@@ -353,7 +520,11 @@ public:
 
             auto cookie = xcb_get_property(connection, true, event->requestor, event->property, XCB_ATOM_ANY, 0, 2048);
             auto reply = xcb_get_property_reply(connection, cookie, nullptr);
-            if (reply) {
+            if (!reply) {
+                fprintf(stderr, "\nxcb_get_property_reply() failed\n");
+                SendReceiveFinish(false);
+                return false;
+            } else {
                 auto len = xcb_get_property_value_length(reply);
                 printf(", len: %d", len);
                 if (event->target == GetAtom("text/plain") ||
@@ -379,6 +550,16 @@ public:
             }
         } else {
             printf("\n");
+        }
+        return true;
+    }
+
+    bool ProcSelectionClear(xcb_selection_clear_event_t *event)
+    {
+        printf("   - XCB_SELECTION_CLEAR            : seq: %4u, time: %10u, owner: 0x%08X, selection: '%s'\n", event->sequence, event->time, event->owner, GetAtomName(event->selection));
+
+        if (event->owner == win) {
+            send.selection_owned = false;
         }
         return true;
     }
@@ -413,8 +594,122 @@ public:
 
     bool ProcButtonPress(xcb_button_press_event_t *event)
     {
-        printf("   - XCB_BUTTON_PRESS               : seq: %4u, time: %10u, root: 0x%08X, event: 0x%08X, child: 0x%08X, event_x: %d, event_y: %d, state: %u, same_screen: %u\n",
-            event->sequence, event->time, event->root, event->event, event->child, event->event_x, event->event_y, event->state, event->same_screen);
+        printf("   - XCB_BUTTON_PRESS               : seq: %4u, time: %10u, root: 0x%08X, event: 0x%08X, child: 0x%08X, root_x: %d, root_y: %d, event_x: %d, event_y: %d, state: %u, same_screen: %u",
+            event->sequence, event->time, event->root, event->event, event->child, event->root_x, event->root_y, event->event_x, event->event_y, event->state, event->same_screen);
+
+        if (event->detail == 1 && ContainPosition(rect, event->event_x, event->event_y)) {
+            auto cookie = xcb_grab_pointer(connection, 0, win, XCB_EVENT_MASK_BUTTON_1_MOTION | XCB_EVENT_MASK_BUTTON_RELEASE, XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC, XCB_WINDOW_NONE, XCB_CURSOR_NONE, XCB_CURRENT_TIME);
+            auto reply = xcb_grab_pointer_reply(connection, cookie, nullptr);
+            if (!reply) {
+                fprintf(stderr, "\nxcb_grab_pointer_reply() failed\n");
+                return false;
+            }
+            auto status = reply->status;
+            printf(", grab_status: %d", status);
+            free(reply);
+            if (status == XCB_GRAB_STATUS_SUCCESS || status == XCB_GRAB_STATUS_ALREADY_GRABBED) {
+                send.grabbed = true;
+                if (!send.selection_owned) {
+                    auto cookie = xcb_set_selection_owner_checked(connection, win, GetAtom("XdndSelection"), XCB_CURRENT_TIME);
+                    auto error = xcb_request_check(connection, cookie);
+                    if (error) {
+                        fprintf(stderr, "\nxcb_set_selection_owner_checked() failed 'XdndSelection' (err: %d)\n", error->error_code);
+                        free(error);
+                        return false;
+                    }
+                    printf(", XdndSelection");
+                    send.selection_owned = true;
+                }
+            }
+        }
+        printf("\n");
+        return true;
+    }
+
+    bool ProcButtonRelease(xcb_button_press_event_t *event)
+    {
+        printf("   - XCB_BUTTON_RELEASE             : seq: %4u, time: %10u, root: 0x%08X, event: 0x%08X, child: 0x%08X, root_x: %d, root_y: %d, event_x: %d, event_y: %d, state: %u, same_screen: %u",
+            event->sequence, event->time, event->root, event->event, event->child, event->root_x, event->root_y, event->event_x, event->event_y, event->state, event->same_screen);
+
+        if (event->detail == 1) {
+            if (send.dst_aware) {
+                printf(", XdndDrop: 0x%08x, XdndVersion: %u", send.dst_win, send.dst_version);
+            } else if (send.dst_win != win) {
+                printf(", pointer_target: 0x%08x", send.dst_win);
+            } else {
+                printf(", pointer_target: same");
+            }
+            printf("\n");
+
+            if (!UnGrabPointer()) {
+                return false;
+            }
+        } else {
+            printf("\n");
+        }
+        return true;
+    }
+
+    bool ProcMotionNotify(xcb_motion_notify_event_t *event)
+    {
+        printf("   - XCB_MOTION_NOTIFY              : seq: %4u, time: %10u, root: 0x%08X, event: 0x%08X, child: 0x%08X, root_x: %d, root_y: %d, event_x: %d, event_y: %d, detail: %u, state: %u, same_screen: %u",
+            event->sequence, event->time, event->root, event->event, event->child, event->root_x, event->root_y, event->event_x, event->event_y, event->detail, event->state, event->same_screen);
+
+        if (event->event == win && send.grabbed) {
+            if (send.query_required) {
+                if (!QueryWindowGeometryTree(send.root)) {
+                    return false;
+                }
+                send.query_required = false;
+            }
+
+            auto dst_win = FindWindowOverPointer(send.root, event->root_x, event->root_y);
+            if (dst_win != XCB_WINDOW_NONE && dst_win != screen->root && dst_win != win) {
+                if (send.dst_win != dst_win) {
+                    auto cookie = xcb_get_property(connection, 0, dst_win, GetAtom("XdndAware"), XCB_ATOM_ANY, 0, 2048);
+                    auto reply = xcb_get_property_reply(connection, cookie, nullptr);
+                    if (!reply) {
+                        fprintf(stderr, "\nxcb_get_property_reply() failed 'XdndAware'\n");
+                        return false;
+                    }
+                    if (xcb_get_property_value_length(reply)) {
+                        send.dst_aware = true;
+                        send.dst_version = *reinterpret_cast<uint32_t *>(xcb_get_property_value(reply));
+                        printf(", XdndEnter: 0x%08x", dst_win);
+                    } else {
+                        send.dst_aware = false;
+                        send.dst_version = 0;
+                    }
+                    send.dst_win = dst_win;
+                    free(reply);
+                }
+                if (send.dst_aware) {
+                    printf(", XdndTarget: 0x%08x, XdndVersion: %u", dst_win, send.dst_version);
+                } else {
+                    printf(", pointer_target: 0x%08x", dst_win);
+                }
+            } else {
+                if (send.dst_aware) {
+                    printf(", XdndLeave: 0x%08x", send.dst_win);
+                } else if (dst_win == win) {
+                    printf(", pointer_target: same");
+                }
+                send.dst_win = XCB_WINDOW_NONE;
+                send.dst_aware = false;
+                send.dst_version = 0;
+            }
+        }
+        printf("\n");
+        return true;
+    }
+
+    bool ProcFocusOut(xcb_focus_out_event_t *event)
+    {
+        printf("   - XCB_FOCUS_OUT                  : seq: %4u, event: 0x%08X, detail: %u, mode: %uu\n", event->sequence, event->event, event->detail, event->mode);
+
+        if (win == event->event) {
+            send.query_required = true;
+        }
         return true;
     }
 
@@ -423,25 +718,13 @@ public:
         printf("   - XCB_PROPERTY_NOTIFY            : seq: %4u, time: %10u, window: 0x%08X, state: '%s', atom: '%s'\n",
             event->sequence, event->time, event->window, event->state == XCB_PROPERTY_NEW_VALUE ? "new" : "del", GetAtomName(event->atom));
 
-        if (event->atom == GetAtom("_NET_WM_WINDOW_TYPE")) {
-            auto cookie = xcb_get_property(connection, 0, event->window, event->atom, XCB_ATOM_ANY, 0, 2048);
-            auto reply = xcb_get_property_reply(connection, cookie, nullptr);
-            if (!reply) {
-                fprintf(stderr, "xcb_get_property_reply() failed\n");
-                return false;
-            }
-            auto atoms = reinterpret_cast<xcb_atom_t *>(xcb_get_property_value(reply));
-            for (uint32_t i = 0; i < reply->length; i++) {
-                printf("     . %s\n", GetAtomName(atoms[i]));
-            }
-        }
         return true;
     }
 
     xcb_window_t CreateWindow(uint16_t width, uint16_t height)
     {
         uint32_t mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
-        std::vector<uint32_t> values = { screen->black_pixel, XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_BUTTON_PRESS};
+        std::vector<uint32_t> values = { screen->black_pixel, XCB_EVENT_MASK_PROPERTY_CHANGE | XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_FOCUS_CHANGE};
 
         xcb_window_t window = xcb_generate_id(connection);
         auto cookie = xcb_create_window_checked(connection, screen->root_depth, window, screen->root,
@@ -521,6 +804,11 @@ public:
                     return false;
                 }
                 break;
+            case XCB_SELECTION_CLEAR:
+                if (!ProcSelectionClear(reinterpret_cast<xcb_selection_clear_event_t *>(event))) {
+                    return false;
+                }
+                break;
             case XCB_CONFIGURE_NOTIFY:
                 if (!ProcConfigureNotify(reinterpret_cast<xcb_configure_notify_event_t *>(event))) {
                     return false;
@@ -533,6 +821,21 @@ public:
                 break;
             case XCB_BUTTON_PRESS:
                 if (!ProcButtonPress(reinterpret_cast<xcb_button_press_event_t *>(event))) {
+                    return false;
+                }
+                break;
+            case XCB_BUTTON_RELEASE:
+                if (!ProcButtonRelease(reinterpret_cast<xcb_button_release_event_t *>(event))) {
+                    return false;
+                }
+                break;
+            case XCB_MOTION_NOTIFY:
+                if (!ProcMotionNotify(reinterpret_cast<xcb_motion_notify_event_t *>(event))) {
+                    return false;
+                }
+                break;
+            case XCB_FOCUS_OUT:
+                if (!ProcFocusOut(reinterpret_cast<xcb_focus_out_event_t *>(event))) {
                     return false;
                 }
                 break;
@@ -678,6 +981,17 @@ private:
     xcb_rectangle_t                             rect                        = {};
     std::map<std::string, xcb_atom_t>           atoms                       = {};
     std::map<xcb_atom_t, std::string>           atom_names                  = {};
+
+    struct
+    {
+        bool                                    grabbed                     = false;
+        bool                                    selection_owned             = false;
+        bool                                    query_required              = true;
+        bool                                    dst_aware                   = false;
+        uint32_t                                dst_version                 = 0;
+        xcb_window_t                            dst_win                     = XCB_WINDOW_NONE;
+        window_t                               *root                        = nullptr;
+    } send;
 
     struct
     {
