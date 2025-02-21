@@ -322,7 +322,93 @@ public:
         receive.types.clear();
     }
 
-    bool SendReceiveStatus(bool accept, bool want_position = true)
+    bool SendEnter(void)
+    {
+        xcb_client_message_event_t event = {
+            .response_type  = XCB_CLIENT_MESSAGE,
+            .format         = 32,
+            .sequence       = 0,
+            .window         = send.dst_win,
+            .type           = GetAtom("XdndEnter"),
+            .data           = { .data32 = { 0, 0, 0, 0, 0 }},
+        };
+        auto &data = event.data.data32;
+
+        // The XID of the source window
+        data[0] = send.src_win;
+
+        // The high byte contains the protocol version to use (minimum of the source's and target's highest supported versions)
+        data[1] |= XDND_PROTOCOL_VERSION << 24;
+
+        if (send.src_types.size() > 3) {
+            auto cookie = xcb_change_property_checked(connection, XCB_PROP_MODE_REPLACE, send.src_win, GetAtom("XdndTypeList"), XCB_ATOM_ATOM, 8 * sizeof(xcb_atom_t), send.src_types.size(), send.src_types.data());
+            auto error = xcb_request_check(connection, cookie);
+            if (error) {
+                free(error);
+                return false;
+            }
+
+            // Bit 0 is set if the source supports more than three data types
+            data[1] |= 0x1;
+        } else {
+            auto i = 2;
+            for (auto type : send.src_types) {
+                data[i++] = type;
+            }
+        }
+
+        auto cookie = xcb_send_event_checked(connection, 0, send.dst_win, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&event));
+        auto error = xcb_request_check(connection, cookie);
+        if (error) {
+            fprintf(stderr, "xcb_send_event_checked() failed 'XdndEnter' (err: %d)\n", error->error_code);
+            free(error);
+            return false;
+        }
+        return true;
+    }
+
+    bool SendPosition(void)
+    {
+        xcb_client_message_event_t event = {
+            .response_type  = XCB_CLIENT_MESSAGE,
+            .format         = 32,
+            .sequence       = 0,
+            .window         = send.dst_win,
+            .type           = GetAtom("XdndPosition"),
+            .data           = { .data32 = { 0, 0, 0, 0, 0 }},
+        };
+        auto &data = event.data.data32;
+
+        // The XID of the source window
+        data[0] = send.src_win;
+
+        // Reserved for future use (flags)
+        data[1] = 0;
+
+        // The coordinates of the mouse position relative to the root window
+        data[2] = (static_cast<uint32_t>(send.root_x << 16)) | send.root_y;
+
+        // The time stamp for retrieving the data (new in version 1)
+        if (send.dst_version >= 1) {
+            data[3] = send.timestamp;
+        }
+
+        // The action requested by the user (new in version 2)
+        if (send.dst_version >= 2) {
+            data[4] = send.action;
+        }
+
+        auto cookie = xcb_send_event_checked(connection, 0, send.dst_win, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&event));
+        auto error = xcb_request_check(connection, cookie);
+        if (error) {
+            fprintf(stderr, "xcb_send_event_checked() failed 'XdndEnter' (err: %d)\n", error->error_code);
+            free(error);
+            return false;
+        }
+        return true;
+    }
+
+    bool SendStatus(bool accept, bool want_position = true)
     {
         xcb_client_message_event_t event = {
             .response_type  = XCB_CLIENT_MESSAGE,
@@ -330,27 +416,37 @@ public:
             .sequence       = 0,
             .window         = receive.src_win,
             .type           = GetAtom("XdndStatus"),
-            .data           = { .data32 = { receive.dst_win, 0, 0, 0, 0 }},
+            .data           = { .data32 = { 0, 0, 0, 0, 0 }},
         };
+        auto &data = event.data.data32;
+
+        // The XID of the target window
+        data[0] = receive.dst_win;
 
         // Bit 0 is set if the current target will accept the drop
         if (accept) {
-            event.data.data32[1] |= 0x1;
+            data[1] |= 0x1;
         }
 
         // Bit 1 is set if the target wants XdndPosition messages while the mouse moves inside the rectangle in data.l[2,3]
         if (want_position) {
-            event.data.data32[1] |= 0x2;
+            data[1] |= 0x2;
         }
 
-        // a rectangle in root coordinates that means "don't send another XdndPosition message until the mouse moves out of here"
-        // an empty rectangle means "send another message when the mouse moves"
-        event.data.data32[2] = (static_cast<uint32_t>(receive.root_x) << 16) | receive.root_y;
-        event.data.data32[3] = (static_cast<uint32_t>(win_w) << 16) | win_h;
+        // The rest of the bits are reserved for future use
+        data[1] |= 0;
 
-        // the action accepted by the target
-        if (accept && receive.version >= 2) {
-            event.data.data32[4] = receive.action;
+        // A rectangle in root coordinates that means "don't send another XdndPosition message until the mouse moves out of here"
+        // An empty rectangle means "send another message when the mouse moves"
+        data[2] = (static_cast<uint32_t>(receive.root_x) << 16) | receive.root_y;
+        data[3] = (static_cast<uint32_t>(win_w) << 16) | win_h;
+
+        // The action accepted by the target
+        data[4] = receive.action;
+
+        // None should be sent if the drop will not be accepted (new in version 2)
+        if (!accept && receive.version >= 2) {
+            data[4] = 0;
         }
 
         auto cookie = xcb_send_event_checked(connection, 0, receive.src_win, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&event));
@@ -361,15 +457,84 @@ public:
             return false;
         }
         printf("   - XdndStatus                     : window: 0x%08x, accepted: %s, want_position: %s, rect_x: %u, rect_y: %u, rect_w: %u, rect_h: %u",
-            receive.src_win, accept ? "yes" : "no", want_position ? "yes" : "no", event.data.data32[2] >> 16, event.data.data32[2] & 0xffff, event.data.data32[3] >> 16, event.data.data32[3] & 0xffff);
-        if (event.data.data32[4]) {
-            printf(", action: %s", GetAtomName(event.data.data32[4]));
+            receive.src_win, accept ? "yes" : "no", want_position ? "yes" : "no", data[2] >> 16, data[2] & 0xffff, data[3] >> 16, data[3] & 0xffff);
+        if (data[4]) {
+            printf(", action: %s", GetAtomName(data[4]));
         }
         printf("\n");
         return true;
     }
 
-    bool SendReceiveFinish(bool accept)
+    bool SendLeave(void)
+    {
+        xcb_client_message_event_t event = {
+            .response_type  = XCB_CLIENT_MESSAGE,
+            .format         = 32,
+            .sequence       = 0,
+            .window         = send.dst_win,
+            .type           = GetAtom("XdndLeave"),
+            .data           = { .data32 = { 0, 0, 0, 0, 0 }},
+        };
+        auto &data = event.data.data32;
+
+        // The XID of the source window
+        data[0] = send.src_win;
+
+        // Reserved for future use (flags)
+        data[1] = 0;
+
+        auto cookie = xcb_send_event_checked(connection, 0, send.dst_win, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&event));
+        auto error = xcb_request_check(connection, cookie);
+        if (error) {
+            fprintf(stderr, "xcb_send_event_checked() failed 'XdndEnter' (err: %d)\n", error->error_code);
+            free(error);
+            return false;
+        }
+
+        send.dst_win = XCB_WINDOW_NONE;
+        send.dst_aware = false;
+        send.dst_version = 0;
+        return true;
+    }
+
+    bool SendDrop(void)
+    {
+        xcb_client_message_event_t event = {
+            .response_type  = XCB_CLIENT_MESSAGE,
+            .format         = 32,
+            .sequence       = 0,
+            .window         = send.dst_win,
+            .type           = GetAtom("XdndDrop"),
+            .data           = { .data32 = { 0, 0, 0, 0, 0 }},
+        };
+        auto &data = event.data.data32;
+
+        // The XID of the source window
+        data[0] = send.src_win;
+
+        // Reserved for future use (flags)
+        data[1] = 0;
+
+        // The time stamp for retrieving the data (new in version 1)
+        if (send.dst_version >= 1) {
+            data[2] = send.timestamp;
+        }
+
+        auto cookie = xcb_send_event_checked(connection, 0, send.dst_win, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&event));
+        auto error = xcb_request_check(connection, cookie);
+        if (error) {
+            fprintf(stderr, "xcb_send_event_checked() failed 'XdndEnter' (err: %d)\n", error->error_code);
+            free(error);
+            return false;
+        }
+
+        send.dst_win = XCB_WINDOW_NONE;
+        send.dst_aware = false;
+        send.dst_version = 0;
+        return true;
+    }
+
+    bool SendFinished(bool accept)
     {
         if (receive.version >= 2) {
             xcb_client_message_event_t event = {
@@ -378,17 +543,24 @@ public:
                 .sequence       = 0,
                 .window         = receive.src_win,
                 .type           = GetAtom("XdndFinished"),
-                .data           = { .data32 = { receive.dst_win, 0, 0, 0, 0 }},
+                .data           = { .data32 = { 0, 0, 0, 0, 0 }},
             };
+            auto &data = event.data.data32;
+
+            // The XID of the target window
+            data[0] = receive.dst_win;
 
             // Bit 0 is set if the current target accepted the drop and successfully performed the accepted drop action
             if (accept) {
-                event.data.data32[1] |= 0x1;
+                data[1] |= 0x1;
             }
+
+            // The rest of the bits are reserved for future use
+            data[1] |= 0;
 
             // the action performed by the target
             if (accept && receive.version >= 2) {
-                event.data.data32[2] = receive.action;
+                data[2] = receive.action;
             }
 
             auto cookie = xcb_send_event_checked(connection, 0, receive.src_win, XCB_EVENT_MASK_NO_EVENT, reinterpret_cast<const char *>(&event));
@@ -400,8 +572,8 @@ public:
                 return false;
             }
             printf("   - XdndFinished                   : window: 0x%08x, accepted: %s", receive.src_win, accept ? "yes" : "no");
-            if (event.data.data32[2]) {
-                printf(", action: %s", GetAtomName(event.data.data32[2]));
+            if (data[2]) {
+                printf(", action: %s", GetAtomName(data[2]));
             }
             printf("\n");
         }
@@ -409,98 +581,205 @@ public:
         return true;
     }
 
+    bool ReceiveEnter(uint32_t data1, uint32_t data2, uint32_t data3, uint32_t data4, uint32_t data5)
+    {
+        // The XID of the source window
+        receive.src_win = data1;
+
+        // The high byte contains the protocol version to use (minimum of the source's and target's highest supported versions)
+        receive.version = data2 >> 24;
+
+        // The rest of the bits are reserved for future use
+
+        // Bit 0 is set if the source supports more than three data types
+        if (data2 & 0x1) {
+            auto cookie = xcb_get_property(connection, 0, receive.src_win, GetAtom("XdndTypeList"), XCB_ATOM_ANY, 0, 2048);
+            auto reply = xcb_get_property_reply(connection, cookie, nullptr);
+            if (!reply) {
+                fprintf(stderr, "xcb_get_property_reply() failed 'XdndTypeList'\n");
+                return false;
+            }
+            auto types = reinterpret_cast<xcb_atom_t *>(xcb_get_property_value(reply));
+            for (uint32_t i = 0; i < reply->length; i++) {
+                receive.types.insert(types[i]);
+            }
+            free(reply);
+        } else {
+            // The first three types that the source supports. Unused slots are set to None
+            if (data3) {
+                receive.types.insert(data3);
+            }
+            if (data4) {
+                receive.types.insert(data4);
+            }
+            if (data5) {
+                receive.types.insert(data5);
+            }
+        }
+        printf(", source: 0x%08X, version: %u, type_len: %lu\n", receive.src_win, receive.version, receive.types.size());
+        for (auto type : receive.types) {
+            printf("     - type: %s\n", GetAtomName(type));
+        }
+        return true;
+    }
+
+    bool ReceivePosition(uint32_t data1, uint32_t data2, uint32_t data3, uint32_t data4, uint32_t data5)
+    {
+        // The XID of the source window
+        receive.src_win = data1;
+
+        // Reserved for future use (flags)
+        receive.flags = data2;
+
+        printf(", source: 0x%08X, flags: 0x%08X", receive.src_win, receive.flags);
+
+        // The coordinates of the mouse position relative to the root window
+        receive.root_x = 0xffff & (data3 >> 16);
+        receive.root_y = 0xffff & data3;
+
+        // The time stamp for retrieving the data (new in version 1)
+        if (receive.version >= 1) {
+            receive.timestamp = data4;
+            printf(", timestamp: %u", receive.timestamp);
+        }
+
+        // the action requested by the user (new in version 2)
+        if (receive.version >= 2) {
+            receive.action = data5;
+            printf(", action: %s", GetAtomName(receive.action));
+        }
+
+        printf(", root_x: %u, root_y: %u", receive.root_x, receive.root_y);
+        auto cookie = xcb_translate_coordinates(connection, screen->root, receive.dst_win, receive.root_x, receive.root_y);
+        auto reply = xcb_translate_coordinates_reply(connection, cookie, nullptr);
+        if (!reply) {
+            fprintf(stderr, "\nxcb_translate_coordinates_reply() failed\n");
+            SendStatus(false);
+            return false;
+        }
+        receive.dst_x = reply->dst_x;
+        receive.dst_y = reply->dst_y;
+        printf(", dst_x: %u, dst_y: %u\n", receive.dst_x, receive.dst_y);
+        free(reply);
+
+        bool accept = ContainPosition(rect, receive.dst_x, receive.dst_y);
+        SendStatus(accept);
+        return true;
+    }
+
+    bool ReceiveStatus(uint32_t data1, uint32_t data2, uint32_t data3, uint32_t data4, uint32_t data5)
+    {
+        // The XID of the target window
+        if (send.dst_win != data1) {
+            return true;
+        }
+
+        // Bit 0 is set if the current target will accept the drop
+        send.accepted = data2 & 0x1;
+
+        // The rest of the bits are reserved for future use
+        send.want_position = data2 & 0x2;
+
+        // A rectangle in root coordinates that means "don't send another XdndPosition message until the mouse moves out of here"
+        // An empty rectangle that means "send another message when the mouse moves"
+        send.rect.x = 0xffff & (data3 >> 16);
+        send.rect.y = 0xffff & data3;
+        send.rect.width = 0xffff & (data4 >> 16);
+        send.rect.height = 0xffff & data4;
+
+        // The action accepted by the target
+        send.action = data5;
+        return true;
+    }
+
+    bool ReceiveLeave(uint32_t data1, uint32_t data2)
+    {
+        // The XID of the source window
+        receive.src_win = data1;
+
+        // Reserved for future use
+        receive.flags = data2;
+
+        printf(", source: 0x%08X, flags: 0x%08X\n", receive.src_win, receive.flags);
+        ClearReceive();
+        return true;
+    }
+
+    bool ReceiveDrop(uint32_t data1, uint32_t data2, uint32_t data3)
+    {
+        // The XID of the source window
+        receive.src_win = data1;
+
+        // Reserved for future use
+        receive.flags = data2;
+
+        printf(", source: 0x%08X, flags: 0x%08X", receive.src_win, receive.flags);
+
+        // The time stamp for retrieving the data. (new in version 1)
+        xcb_timestamp_t timestamp = XCB_CURRENT_TIME;
+        if (receive.version >= 1) {
+            timestamp = data3;
+            receive.timestamp = data3;
+            printf(", timestamp: %u", receive.timestamp);
+        }
+        printf("\n");
+
+        for (auto type : receive.types) {
+            xcb_atom_t property = XCB_ATOM_CUT_BUFFER0 + (cut_buffer_idx++ % 8);
+            auto cookie = xcb_convert_selection_checked(connection, receive.dst_win, GetAtom("XdndSelection"), type, property, timestamp);
+            auto error = xcb_request_check(connection, cookie);
+            if (error) {
+                fprintf(stderr, "xcb_convert_selection_checked() failed (err: %d)\n", error->error_code);
+                free(error);
+                SendFinished(false);
+                return false;
+            }
+            receive.targets.insert(type);
+        }
+        return true;
+    }
+
+    bool ReceiveFinished(uint32_t data1, uint32_t data2, uint32_t data3)
+    {
+        if (send.dst_win != data1) {
+            return true;
+        }
+
+        if (send.dst_version >= 2) {
+            // The XID of the target window
+            send.dst_win = data1;
+
+            // Bit 0 is set if the current target accepted the drop and successfully performed the accepted drop action (new in version 5)
+            if (send.dst_version >= 5) {
+                send.accepted = data2 & 0x1;
+            }
+
+            // The rest of the bits are reserved for future use
+
+            // The action performed by the target
+            send.action = data3;
+        }
+        return true;
+    }
+
     bool ProcClientMessage(xcb_client_message_event_t *event)
     {
         printf("   - XCB_CLIENT_MESSAGE             : seq: %4u, window: 0x%08X, type: %s", event->sequence, event->window, GetAtomName(event->type));
 
+        auto &data = event->data.data32;
         if (event->type == GetAtom("XdndEnter")) {
-            bool has_list = event->data.data32[1] & 1;
             receive.dst_win = event->window;
-            receive.src_win = event->data.data32[0];
-            receive.version = event->data.data32[1] >> 24;
-            if (has_list) {
-                auto cookie = xcb_get_property(connection, 0, receive.src_win, GetAtom("XdndTypeList"), XCB_ATOM_ANY, 0, 2048);
-                auto reply = xcb_get_property_reply(connection, cookie, nullptr);
-                if (!reply) {
-                    fprintf(stderr, "xcb_get_property_reply() failed 'XdndTypeList'\n");
-                    return false;
-                }
-                auto types = reinterpret_cast<xcb_atom_t *>(xcb_get_property_value(reply));
-                for (uint32_t i = 0; i < reply->length; i++) {
-                    receive.types.insert(types[i]);
-                }
-                free(reply);
-            } else {
-                for (auto i = 2; i < 5; i++) {
-                    auto type = event->data.data32[i];
-                    if (type) {
-                        receive.types.insert(type);
-                    }
-                }
-            }
-            printf(", source: 0x%08X, version: %u, has_list: %s\n", receive.src_win, receive.version, has_list ? "yes" : "no");
-            for (auto type : receive.types) {
-                printf("     - type: %s\n", GetAtomName(type));
-            }
+            return ReceiveEnter(data[0], data[1], data[2], data[3], data[4]);
         } else if (event->type == GetAtom("XdndPosition")) {
-            receive.src_win = event->data.data32[0];
-            receive.flags = event->data.data32[1]; // reserved for future use
-            printf(", source: 0x%08X, flags: 0x%08X", receive.src_win, receive.flags);
-            if (receive.version >= 1) {
-                receive.timestamp = event->data.data32[3];
-                printf(", timestamp: %u", receive.timestamp);
-            }
-            if (receive.version >= 2) {
-                receive.action = event->data.data32[4];
-                printf(", action: %s", GetAtomName(receive.action));
-            }
-            receive.root_x = 0xffff & (event->data.data32[2] >> 16);
-            receive.root_y = 0xffff & event->data.data32[2];
-            printf(", root_x: %u, root_y: %u", receive.root_x, receive.root_y);
-
-            auto cookie = xcb_translate_coordinates(connection, screen->root, event->window, receive.root_x, receive.root_y);
-            auto reply = xcb_translate_coordinates_reply(connection, cookie, nullptr);
-            if (!reply) {
-                fprintf(stderr, "\nxcb_translate_coordinates_reply() failed\n");
-                SendReceiveStatus(false);
-                return false;
-            }
-            receive.dst_x = reply->dst_x;
-            receive.dst_y = reply->dst_y;
-            printf(", dst_x: %u, dst_y: %u\n", receive.dst_x, receive.dst_y);
-            free(reply);
-
-            bool accept = ContainPosition(rect, receive.dst_x, receive.dst_y);
-            SendReceiveStatus(accept);
+            return ReceivePosition(data[0], data[1], data[2], data[3], data[4]);
+        } else if (event->type == GetAtom("XdndStatus")) {
+            return ReceiveStatus(data[0], data[1], data[2], data[3], data[4]);
         } else if (event->type == GetAtom("XdndLeave")) {
-            receive.src_win = event->data.data32[0];
-            receive.flags = event->data.data32[1]; // reserved for future use
-            printf(", source: 0x%08X, flags: 0x%08X\n", receive.src_win, receive.flags);
-            ClearReceive();
+            return ReceiveLeave(data[0], data[1]);
         } else if (event->type == GetAtom("XdndDrop")) {
-            xcb_timestamp_t timestamp = XCB_CURRENT_TIME;
-            receive.src_win = event->data.data32[0];
-            receive.flags = event->data.data32[1]; // reserved for future use
-            printf(", source: 0x%08X, flags: 0x%08X", receive.src_win, receive.flags);
-            if (receive.version >= 1) {
-                timestamp = event->data.data32[2];
-                receive.timestamp = event->data.data32[2];
-                printf(", timestamp: %u", receive.timestamp);
-            }
-            printf("\n");
-
-            for (auto type : receive.types) {
-                xcb_atom_t property = XCB_ATOM_CUT_BUFFER0 + (cut_buffer_idx++ % 8);
-                auto cookie = xcb_convert_selection_checked(connection, event->window, GetAtom("XdndSelection"), type, property, timestamp);
-                auto error = xcb_request_check(connection, cookie);
-                if (error) {
-                    fprintf(stderr, "xcb_convert_selection_checked() failed (err: %d)\n", error->error_code);
-                    free(error);
-                    SendReceiveFinish(false);
-                    return false;
-                }
-                receive.targets.insert(type);
-            }
+            return ReceiveDrop(data[0], data[1], data[2]);
+        } else if (event->type == GetAtom("XdndFinished")) {
+            return ReceiveFinished(data[0], data[1], data[2]);
         } else {
             printf("\n");
         }
@@ -522,7 +801,7 @@ public:
             auto reply = xcb_get_property_reply(connection, cookie, nullptr);
             if (!reply) {
                 fprintf(stderr, "\nxcb_get_property_reply() failed\n");
-                SendReceiveFinish(false);
+                SendFinished(false);
                 return false;
             } else {
                 auto len = xcb_get_property_value_length(reply);
@@ -546,7 +825,7 @@ public:
             printf("\n");
             receive.targets.erase(event->target);
             if (receive.targets.empty()) {
-                SendReceiveFinish(true);
+                SendFinished(true);
             }
         } else {
             printf("\n");
@@ -597,7 +876,7 @@ public:
         printf("   - XCB_BUTTON_PRESS               : seq: %4u, time: %10u, root: 0x%08X, event: 0x%08X, child: 0x%08X, root_x: %d, root_y: %d, event_x: %d, event_y: %d, state: %u, same_screen: %u",
             event->sequence, event->time, event->root, event->event, event->child, event->root_x, event->root_y, event->event_x, event->event_y, event->state, event->same_screen);
 
-        if (event->detail == 1 && ContainPosition(rect, event->event_x, event->event_y)) {
+        if (event->event == win && event->detail == 1 && ContainPosition(rect, event->event_x, event->event_y)) {
             auto cookie = xcb_grab_pointer(connection, 0, win, XCB_EVENT_MASK_BUTTON_1_MOTION | XCB_EVENT_MASK_BUTTON_RELEASE, XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC, XCB_WINDOW_NONE, XCB_CURSOR_NONE, XCB_CURRENT_TIME);
             auto reply = xcb_grab_pointer_reply(connection, cookie, nullptr);
             if (!reply) {
@@ -605,6 +884,7 @@ public:
                 return false;
             }
             auto status = reply->status;
+            send.src_win = event->event;
             printf(", grab_status: %d", status);
             free(reply);
             if (status == XCB_GRAB_STATUS_SUCCESS || status == XCB_GRAB_STATUS_ALREADY_GRABBED) {
@@ -634,10 +914,10 @@ public:
         if (event->detail == 1) {
             if (send.dst_aware) {
                 printf(", XdndDrop: 0x%08x, XdndVersion: %u", send.dst_win, send.dst_version);
-            } else if (send.dst_win != win) {
-                printf(", pointer_target: 0x%08x", send.dst_win);
-            } else {
+            } else if (send.dst_win == win) {
                 printf(", pointer_target: same");
+            } else if (send.dst_win != XCB_WINDOW_NONE) {
+                printf(", pointer_target: 0x%08x", send.dst_win);
             }
             printf("\n");
 
@@ -665,6 +945,7 @@ public:
 
             auto dst_win = FindWindowOverPointer(send.root, event->root_x, event->root_y);
             if (dst_win != XCB_WINDOW_NONE && dst_win != screen->root && dst_win != win) {
+                bool send_enter = false;
                 if (send.dst_win != dst_win) {
                     auto cookie = xcb_get_property(connection, 0, dst_win, GetAtom("XdndAware"), XCB_ATOM_ANY, 0, 2048);
                     auto reply = xcb_get_property_reply(connection, cookie, nullptr);
@@ -673,7 +954,10 @@ public:
                         return false;
                     }
                     if (xcb_get_property_value_length(reply)) {
+                        send_enter = true;
                         send.dst_aware = true;
+                        send.block_position = false;
+                        send.action = GetAtom("XdndActionCopy");
                         send.dst_version = *reinterpret_cast<uint32_t *>(xcb_get_property_value(reply));
                         printf(", XdndEnter: 0x%08x", dst_win);
                     } else {
@@ -688,18 +972,33 @@ public:
                 } else {
                     printf(", pointer_target: 0x%08x", dst_win);
                 }
+                printf("\n");
+
+                if (send_enter) {
+                    if (!SendEnter()) {
+                        return false;
+                    }
+                }
+                if (!send.block_position) {
+                    send.block_position = true;
+                    send.root_x = event->root_x;
+                    send.root_y = event->root_y;
+                    if (!SendPosition()) {
+                        return false;
+                    }
+                }
             } else {
                 if (send.dst_aware) {
-                    printf(", XdndLeave: 0x%08x", send.dst_win);
+                    printf(", XdndLeave: 0x%08x\n", send.dst_win);
+                    return SendLeave();
                 } else if (dst_win == win) {
                     printf(", pointer_target: same");
                 }
-                send.dst_win = XCB_WINDOW_NONE;
-                send.dst_aware = false;
-                send.dst_version = 0;
+                printf("\n");
             }
+        } else {
+            printf("\n");
         }
-        printf("\n");
         return true;
     }
 
@@ -987,9 +1286,19 @@ private:
         bool                                    grabbed                     = false;
         bool                                    selection_owned             = false;
         bool                                    query_required              = true;
+        bool                                    block_position              = false;
+        bool                                    want_position               = false;
+        bool                                    accepted                    = false;
         bool                                    dst_aware                   = false;
         uint32_t                                dst_version                 = 0;
         xcb_window_t                            dst_win                     = XCB_WINDOW_NONE;
+        xcb_window_t                            src_win                     = XCB_WINDOW_NONE;
+        std::vector<xcb_atom_t>                 src_types                   = {};
+        int16_t                                 root_x                      = 0;
+        int16_t                                 root_y                      = 0;
+        xcb_rectangle_t                         rect                        = {};
+        uint32_t                                timestamp                   = XCB_CURRENT_TIME;
+        xcb_atom_t                              action                      = XCB_ATOM_NONE;
         window_t                               *root                        = nullptr;
     } send;
 
@@ -1012,12 +1321,20 @@ private:
 
 int main(int argc, char **argv)
 {
-    printf("Example xcb_net_wm\n");
+    printf("Example xcb_xdnd\n");
 
-    auto obj = DND();
-    if (!obj.Init() || !obj.ShowCase()) {
-        printf("\nFailed..\n");
-        return EXIT_FAILURE;
+    pid_t pid = 0;
+    switch (pid = fork())
+    {
+        case -1:
+            break;
+        default: {
+            auto obj = DND();
+            if (!obj.Init() || !obj.ShowCase()) {
+                printf("\nFailed..\n");
+                return EXIT_FAILURE;
+            }
+        }   break;
     }
     printf("\nSucceed..\n");
     return EXIT_SUCCESS;
